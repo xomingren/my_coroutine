@@ -2,7 +2,7 @@
 #ifndef __CO_TIME_HPP__
 #define __CO_TIME_HPP__
 
-#include <chrono>
+#include <chrono>  //for std::chrono
 
 #include "common.hpp"
 
@@ -10,7 +10,7 @@ namespace CO {
 
 class Time {
  public:
-  static useconds GetTime() {
+  [[maybe_unused]] static useconds GetTime() {
     return std::chrono::system_clock::now().time_since_epoch().count();
   }
 
@@ -30,9 +30,6 @@ class Time {
     } else
       e->state = State::kSuspend;
 
-    // e->calledbywho = 0;
-    // getcontext(e->context.get());
-    // if (e->calledbywho == 0) pinstance->Schedule();
     pinstance->SwitchContext(e);
 
     if (e->type & Interrupt) {

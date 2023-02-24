@@ -1,30 +1,12 @@
-#include <arpa/inet.h>
-#include <errno.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-
-#include <iostream>
-
 #include "../coroutine/co_io.hpp"
 #include "../coroutine/coroutine.h"
+#include "../coroutine/tcpserver.hpp"
 #include "../coroutine/time.hpp"
 
-const int kPort = 8088;
-
-#define ERR_EXIT(m) \
-  do {              \
-    perror(m);      \
-    exit(-1);       \
-  } while (0)
 using namespace CO;
 using namespace std;
 
-Coroutine *co;
-
-void *TcpConnection(void *arg) {
+void *Echo(void *arg) {
   NetFd *client_netfd = (NetFd *)arg;
   int client_fd = client_netfd->osfd;
 
@@ -40,21 +22,22 @@ void *TcpConnection(void *arg) {
   inet_ntop(client_addr.sin_family, &client_addr.sin_addr, ip_buf,
             sizeof(ip_buf));
 
-  while (1) {
+  for (;;) {
     char buf[1024] = {0};
-    // here the first time fd get from accept going into AddFD and
+    // here the first time fd get from accept going into RegisterEvent and
     // become
     ssize_t ret = co_read(client_netfd, buf, sizeof(buf), kNerverTimeout);
     if (ret == -1) {
       printf("client co_read error\n");
       break;
     } else if (ret == 0) {
-      printf("client quit, fd = %d, ip = %s\n", client_netfd->osfd, ip_buf);
-      closeNetFD(client_netfd);
+      printf("client quit, fd = %d, ip = %s:%d\n", client_netfd->osfd, ip_buf,
+             client_addr.sin_port);
+      if (closeNetFD(client_netfd) < 0) printf("close fd error\n");
       break;
     }
 
-    printf("recv from %s, data = %s\n", ip_buf, buf);
+    printf("recv from %s:%d, data = %s\n", ip_buf, client_addr.sin_port, buf);
 
     ret = co_write(client_netfd, buf, ret, kNerverTimeout);
     if (ret == -1) {
@@ -64,66 +47,11 @@ void *TcpConnection(void *arg) {
   return nullptr;
 }
 
-void *Acceptor(void *arg) {
-  while (1) {
-    NetFd *client_netfd = co_accept((NetFd *)arg, NULL, NULL, kNerverTimeout);
-    if (client_netfd == NULL) {
-      continue;
-    }
-
-    printf("get a new client, fd = %d\n", (client_netfd->osfd));
-
-    Entity *connection =
-        co->co_create(bind(TcpConnection, (void *)client_netfd), 0, 0);
-    if (connection == NULL) {
-      printf("failed co_create client coroutine\n");
-    }
-  }
-}
-
 int main() {
-  int ret = 0;
-  co = Coroutine::getInstance();
+  TcpServer *server = TcpServer::getInstance();
+  server->start(bind(Echo, placeholders::_1));
 
-  int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (listen_fd == -1) {
-    ERR_EXIT("socket");
-  }
-
-  int reuse_socket = 1;
-  ret = setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse_socket,
-                   sizeof(int));
-  if (ret == -1) {
-    ERR_EXIT("setsockopt");
-  }
-
-  sockaddr_in server_addr;
-  server_addr.sin_family = AF_INET;
-  server_addr.sin_port = htons(kPort);
-  server_addr.sin_addr.s_addr = INADDR_ANY;
-
-  ret = bind(listen_fd, (sockaddr *)&server_addr, sizeof(sockaddr));
-  if (ret == -1) {
-    ERR_EXIT("bind");
-  }
-
-  ret = listen(listen_fd, 128);
-  if (ret == -1) {
-    ERR_EXIT("listen");
-  }
-
-  NetFd *co_netfd = CO::newNetFD(listen_fd, 1, 1);
-  if (!co_netfd) {
-    printf("NetFd open socket failed.\n");
-    return -1;
-  }
-
-  Entity *acceptor = co->co_create(std::bind(Acceptor, (void *)co_netfd), 1, 0);
-  if (acceptor == nullptr) {
-    printf("failed to co_create listen coroutine\n");
-  }
-
-  while (1) {
+  for (;;) {
     CO::Time::sleep_for(1);
   }
 

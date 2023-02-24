@@ -1,10 +1,15 @@
 #include "coroutine.h"
 
-#include <assert.h>
+#include <assert.h>  //for assert
 #include <poll.h>    //for pollfd
 #include <stddef.h>  //for __builtin_offsetof
 
+#ifdef USE_EPOLL
 #include "poller.h"
+#elif defined(USE_IOURING)
+#include "iouring.hpp"
+#endif
+
 #include "time.hpp"
 
 using namespace CO;
@@ -12,9 +17,9 @@ using namespace std;
 
 GUID CO::Coroutine::id_ = 0;
 
-GUID CO::Coroutine::IDGenerator() { return id_++; }
+GUID CO::Coroutine::IDGenerator() noexcept { return id_++; }
 
-void CO::Coroutine::InitQueue(DoubleLinkedList *l) {
+void CO::Coroutine::InitQueue(DoubleLinkedList *l) noexcept {
   l->next = l;
   l->prev = l;
 }
@@ -32,7 +37,12 @@ CO::Coroutine::Coroutine() {
   memset(&zombie_queue_, 0, sizeof(zombie_queue_));
   sleep_queue_ = nullptr;
   sleep_queue_size_ = 0;
+#ifdef USE_EPOLL
   poller_ = make_unique<Poller>();
+#elif defined(USE_IOURING)
+  poller_ = make_unique<IOuring>();
+#endif
+
   assert(-1 != InitOrDie());
 }
 
@@ -50,11 +60,8 @@ void CO::Coroutine::yield() {
     return;
   }
 
-  co->state = CO::State::KReady;
+  co->state = CO::State::kReady;
   AddToRunableQueueTail(co);
-  // co->calledbywho = 0;
-  // getcontext(co->context.get());
-  // if (co->calledbywho == 0) Coroutine::getInstance()->Schedule();
   SwitchContext(co);
 }
 
@@ -70,13 +77,15 @@ int CO::Coroutine::InitOrDie(size_t coroutine_num) {
   InitQueue(&zombie_queue_);
 
   // 调用IO多路复用函数对应的初始化函数
-  if (poller_->pollerInitOrDie() < 0) return -1;
+  [[unlikely]] if (poller_->pollerInitOrDie() < 0)
+    return -1;
   last_time_checked = Time::GetTime();
 
   // 创建idle微线程，idle微线程主要用于调用epoll等待IO事件和处理定时器
   main_coroutine_ =
       co_create(bind(&CO::Coroutine::MainLoop, this), 0, kStacksize);
-  if (nullptr == main_coroutine_) return -1;
+  [[unlikely]] if (nullptr == main_coroutine_)
+    return -1;
   main_coroutine_->type = CO::Type::Main;
   active_count_--;
   // 将idle微线程从runable队列移除，由于idle微线程只在没有微线程可以运行时，才会主动调度，
@@ -90,7 +99,8 @@ int CO::Coroutine::InitOrDie(size_t coroutine_num) {
   primordial->guid = IDGenerator();
   // primordial =  (Entity *)calloc(1, sizeof(Entity) + (kKeysMax * sizeof(void
   // *)));
-  if (nullptr == primordial) return -1;
+  [[unlikely]] if (nullptr == primordial)
+    return -1;
   // co->private_data = (void **)(co + 1);
   primordial->state = CO::State::kRunning;
   primordial->type = CO::Type::Primordial;
@@ -111,11 +121,13 @@ int CO::Coroutine::InitOrDie(size_t coroutine_num) {
   return 0;
 }
 
-Entity *CO::Coroutine::GetFromRunableQueue(DoubleLinkedList *queue) {
+Entity *CO::Coroutine::GetFromRunableQueue(
+    DoubleLinkedList *queue) const noexcept {
   return ((Entity *)((char *)(queue) - __builtin_offsetof(Entity, links)));
 }
 
-PollQueue *CO::Coroutine::GetFromPollerQueue(DoubleLinkedList *queue) {
+PollQueue *CO::Coroutine::GetFromPollerQueue(
+    DoubleLinkedList *queue) const noexcept {
   return (
       (PollQueue *)((char *)(queue) - __builtin_offsetof(PollQueue, links)));
 }
@@ -154,11 +166,8 @@ void *CO::Coroutine::MainLoop() {
     CheckSleep();
 
     // 交出运行权，并从runable队列st_vp_t.run_q中调度下一个微线程运行
-    main->state = CO::State::KReady;
+    main->state = CO::State::kReady;
     SwitchContext(main);
-    // main->calledbywho = 0;
-    // getcontext(main->context.get());
-    // if (0 == main->calledbywho) Schedule();
   }
 
   /* No more threads */
@@ -181,7 +190,7 @@ void CO::Coroutine::Schedule() {
     co = main_coroutine_;
   }
 
-  assert(co->state == CO::State::KReady);
+  assert(co->state == CO::State::kReady);
   co->state = CO::State::kRunning;
 
   // 如果函数 setcontext 执行成功，那么调用 setcontext
@@ -200,7 +209,7 @@ void CO::Coroutine::SwitchContext(Entity *cur) {
 void CO::Coroutine::DoWork() {
   Entity *co = current_coroutine_;
 
-  co->retval = manager_.Excute<void *>(co->guid);
+  co->retval = manager_.Excute<void *>(co->guid);  // fixme
 
   OnExit(co->retval);
 }
@@ -283,7 +292,7 @@ void CO::Coroutine::CheckSleep(void) {
 
     /* Make co runnable */
     assert(!(coroutine->type & Type::Main));
-    coroutine->state = CO::State::KReady;
+    coroutine->state = CO::State::kReady;
     // Insert at the head of RunQ, to execute timer first.
     InsertAfterRunableQueueHead(coroutine);
   }
@@ -363,7 +372,7 @@ void CO::Coroutine::HeapDelete(Entity *co) {
     }
   }
   t = *p;
-  *p = NULL;
+  *p = nullptr;
   --sleep_queue_size_;
   if (t != co) {
     /*
@@ -384,7 +393,7 @@ void CO::Coroutine::HeapDelete(Entity *co) {
       int index_tmp;
       if (t->pleft == nullptr)
         break;
-      else if (t->pright == NULL)
+      else if (t->pright == nullptr)
         y = t->pleft;
       else if (t->pleft->due < t->pright->due)
         y = t->pleft;
@@ -413,9 +422,12 @@ void CO::Coroutine::HeapDelete(Entity *co) {
       }
     }
   }
-  co->pleft = co->pright = NULL;
+  co->pleft = co->pright = nullptr;
 }
 
+#ifdef USE_EPOLL
+
+// pollfd is for compatible with poll and kqueue, may consider change it
 int CO::Coroutine::Poll(pollfd *pds, int npds, useconds timeout) {
   pollfd *pd;
   pollfd *epd = pds + npds;
@@ -429,7 +441,7 @@ int CO::Coroutine::Poll(pollfd *pds, int npds, useconds timeout) {
   //   return -1;
   // }
 
-  if (poller_->AddFD(pds, npds) < 0) return -1;
+  if (poller_->RegisterEvent(pds, npds) < 0) return -1;
 
   pq.pds = pds;
   pq.npds = npds;
@@ -437,20 +449,17 @@ int CO::Coroutine::Poll(pollfd *pds, int npds, useconds timeout) {
   pq.on_ioq = 1;
   AddToIOQueue(&pq);
   if (timeout != kNerverTimeout) AddToSleepQueue(me, timeout);
-  me->state = State::KIOWait;
+  me->state = State::kIOWait;
 
-  // me->calledbywho = 0;
-  // getcontext(me->context.get());
-  // if (me->calledbywho == 0) Schedule();
   SwitchContext(me);
 
   n = 0;
   if (pq.on_ioq) {
-    /* If we timed out, the pollq might still be on the ioq. Remove it */
+    // if we timedout, the pollq might still be on the ioq. remove it
     DeleteFromIOQueue(&pq);
-    poller_->DeleteFD(pds, npds);
+    poller_->RemoveEvent(pds, npds);
   } else {
-    /* Count the number of ready descriptors */
+    // count the number of ready descriptors
     for (pd = pds; pd < epd; pd++) {
       if (pd->revents) n++;
     }
@@ -465,7 +474,56 @@ int CO::Coroutine::Poll(pollfd *pds, int npds, useconds timeout) {
   return n;
 }
 
-Poller *CO::Coroutine::get_poller() const { return poller_.get(); }
+Poller *CO::Coroutine::get_poller() const noexcept { return poller_.get(); }
+
+#elif defined(USE_IOURING)
+
+// pollfd is for compatible with poll and kqueue, may consider change it
+int CO::Coroutine::Poll(vector<UringDetail *> data, useconds timeout) {
+  PollQueue node;
+  Entity *me = current_coroutine_;
+  int n;
+
+  // if (me->flags & _ST_FL_INTERRUPT) {
+  //   me->flags &= ~_ST_FL_INTERRUPT;
+  //   errno = EINTR;
+  //   return -1;
+  // }
+
+  if (poller_->submit() <= 0) return -1;
+  node.fdlist = data;
+  node.coroutine = me;
+  node.on_ioq = 1;
+  AddToIOQueue(&node);
+  if (timeout != kNerverTimeout) AddToSleepQueue(me, timeout);
+  me->state = State::kIOWait;
+
+  SwitchContext(me);
+
+  n = 0;
+  if (node.on_ioq) {
+    /* If we timed out, the pollq might still be on the ioq. Remove it */
+    DeleteFromIOQueue(&node);
+    // poller_->seen();
+  } else {
+    /* Count the number of ready descriptors */
+    for (auto i : node.fdlist) {
+      if (i->is_active) ++n;
+    }
+  }
+
+  // if (me->flags & _ST_FL_INTERRUPT) {
+  //   me->flags &= ~_ST_FL_INTERRUPT;
+  //   errno = EINTR;
+  //   return -1;
+  // }
+
+  return n;
+}
+
+IOuring *CO::Coroutine::get_poller() const noexcept { return poller_.get(); }
+
+#endif
 
 void CO::Coroutine::DeleteFromSleepQueue(Entity *coroutine) {
   HeapDelete(coroutine);

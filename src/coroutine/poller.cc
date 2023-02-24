@@ -1,9 +1,11 @@
 #include "poller.h"
 
-#include <errno.h>
-#include <fcntl.h>  //for fcntl()
-#include <poll.h>   //for pollfd
-#include <sys/epoll.h>
+#ifdef USE_EPOLL
+
+#include <errno.h>      //for errno
+#include <fcntl.h>      //for fcntl()
+#include <poll.h>       //for pollfd
+#include <sys/epoll.h>  //for epoll
 
 #include "coroutine.h"
 
@@ -15,12 +17,6 @@ CO::Poller::Poller()
       epfd_(-1),
       evtlist_(maxfd_, epoll_event()),
       revtlist_(maxfd_, nullptr) {
-  // for (int i = 0; i < evtlist_.size(); ++i) {
-  //   evtlist_[i] = new epoll_event;
-  //   memset(evtlist_[i], 0, sizeof(epoll_event));
-  //   // evtlist_[i]->data.ptr = new FDDetail;
-  //   // FD_RAWFD(i) = i;
-  // }
   for (int i = 0; i < revtlist_.size(); ++i) {
     revtlist_[i] = new FDDetail;
     memset(revtlist_[i], 0, sizeof(FDDetail));
@@ -29,17 +25,9 @@ CO::Poller::Poller()
 }
 
 CO::Poller::~Poller() {
-  // for (int i = 0; i < evtlist_.size(); ++i) {
-  //   // delete reinterpret_cast<FDDetail *>(evtlist_[i]->data.ptr);
-  //   // evtlist_[i]->data.ptr = nullptr;
-  //   delete evtlist_[i];
-  //   evtlist_[i] = nullptr;
-  // }
   vector<epoll_event> empty;
   evtlist_.swap(empty);
   for (int i = 0; i < revtlist_.size(); ++i) {
-    // delete reinterpret_cast<FDDetail *>(evtlist_[i]->data.ptr);
-    // evtlist_[i]->data.ptr = nullptr;
     delete revtlist_[i];
     revtlist_[i] = nullptr;
   }
@@ -47,7 +35,7 @@ CO::Poller::~Poller() {
   revtlist_.swap(emptyr);
 }
 
-int CO::Poller::GetEvents(int fd) const {
+int CO::Poller::GetEvents(int fd) const noexcept {
   int events = 0;
   events |= (FD_READ_CNT(fd) ? EPOLLIN : 0);
   events |= (FD_WRITE_CNT(fd) ? EPOLLOUT : 0);
@@ -58,7 +46,7 @@ int CO::Poller::GetEvents(int fd) const {
 int CO::Poller::pollerInitOrDie(void) {
   int err = 0;
 
-  if ((epfd_ = epoll_create(1)) < 0) {
+  [[unlikely]] if ((epfd_ = epoll_create(1)) < 0) {
     err = errno;
     return -1;
   }
@@ -67,13 +55,14 @@ int CO::Poller::pollerInitOrDie(void) {
   return 0;
 }
 
-int CO::Poller::CheckValidFD(int osfd) const {
-  if (osfd >= maxfd_) return -1;
+int CO::Poller::CheckValidFD(int osfd) const noexcept {
+  [[unlikely]] if (osfd >= maxfd_)
+    return -1;
 
   return 0;
 }
 
-void CO::Poller::DeleteFD(pollfd *pds, int npds) {
+void CO::Poller::RemoveEvent(pollfd *pds, int npds) {
   epoll_event ev;
   pollfd *pd;
   pollfd *epd = pds + npds;
@@ -81,7 +70,7 @@ void CO::Poller::DeleteFD(pollfd *pds, int npds) {
 
   for (pd = pds; pd < epd; ++pd) {
     old_events = GetEvents(pd->fd);
-
+    // decrease the event count that fullfilled
     if (pd->events & POLLIN) FD_READ_CNT(pd->fd)
     --;
     if (pd->events & POLLOUT) FD_WRITE_CNT(pd->fd)
@@ -107,19 +96,19 @@ void CO::Poller::DeleteFD(pollfd *pds, int npds) {
   }
 }
 
-int CO::Poller::AddFD(pollfd *pds, int npds) {
+int CO::Poller::RegisterEvent(pollfd *pds, int npds) {
   epoll_event ev;
   int i, fd;
   int old_events, events, op;
 
   for (i = 0; i < npds; i++) {
     fd = pds[i].fd;
-    if (fd < 0 || !pds[i].events ||
-        (pds[i].events & ~(POLLIN | POLLOUT | POLLPRI))) {
+    [[unlikely]] if (fd < 0 || !pds[i].events ||
+                     (pds[i].events & ~(POLLIN | POLLOUT | POLLPRI))) {
       errno = EINVAL;
       return -1;
     }
-    if (fd >= maxfd_)  // fixme
+    [[unlikely]] if (fd >= maxfd_)  // fixme
       return -1;
   }
 
@@ -138,6 +127,7 @@ int CO::Poller::AddFD(pollfd *pds, int npds) {
       op = old_events ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
 
       ev.events = events;
+      events |= EPOLLET;
       FD_RAWFD(fd) = fd;
       ev.data.ptr = reinterpret_cast<void *>(revtlist_[fd]);
 
@@ -149,11 +139,11 @@ int CO::Poller::AddFD(pollfd *pds, int npds) {
     }
   }
 
-  if (i < npds) {
+  [[unlikely]] if (i < npds) {
     /* Error */
     int err = errno;
     /* Unroll the state */
-    DeleteFD(pds, i + 1);
+    RemoveEvent(pds, i + 1);
     errno = err;
     return -1;
   }
@@ -161,7 +151,7 @@ int CO::Poller::AddFD(pollfd *pds, int npds) {
   return 0;
 }
 
-int CO::Poller::PrerareCloseFD(int osfd) {
+int CO::Poller::PrepareCloseFD(int osfd) const noexcept {
   if (FD_READ_CNT(osfd) || FD_WRITE_CNT(osfd) || FD_EXCEP_CNT(osfd)) {
     errno = EBUSY;
     return -1;
@@ -200,13 +190,14 @@ void CO::Poller::Dispatch(void) {
   /* Check for I/O operations */
   nfd = epoll_wait(epfd_, evtlist_.data(), maxfd_, timeout);
 
-  if (nfd > 0) {
-    // fill revents
+  if (nfd > 0) {  // if not timeout
+    // fill revents with its fd
     for (i = 0; i < nfd; i++) {
       osfd = reinterpret_cast<FDDetail *>(evtlist_[i].data.ptr)->rawfd;
       FD_REVENTS(osfd) = evtlist_[i].events;
       if (FD_REVENTS(osfd) & (EPOLLERR | EPOLLHUP)) {
-        /* Also set I/O bits on error */
+        // also set I/O bits on error
+        //  error happend, save the events before this loop till next loop
         FD_REVENTS(osfd) |= GetEvents(osfd);
       }
     }
@@ -216,7 +207,7 @@ void CO::Poller::Dispatch(void) {
          q = q->next) {
       pq = pinstance->GetFromPollerQueue(q);
       notify = 0;
-      // how many item on ioq
+      // how many fd on single node of ioq
       epds = pq->pds + pq->npds;
 
       for (pds = pq->pds; pds < epds; pds++) {
@@ -226,7 +217,7 @@ void CO::Poller::Dispatch(void) {
         }
         osfd = pds->fd;
         events = pds->events;
-        revents = 0;
+        revents = 0;  // comfirm twice, this is the real revent
         if ((events & POLLIN) && (FD_REVENTS(osfd) & EPOLLIN))
           revents |= POLLIN;
         if ((events & POLLOUT) && (FD_REVENTS(osfd) & EPOLLOUT))
@@ -240,36 +231,40 @@ void CO::Poller::Dispatch(void) {
         if (revents) {
           notify = 1;
         }
-      }
-      // 1 coroutine checked
+      }  // 1 coroutine checked
+
       if (notify) {
         pinstance->DeleteFromIOQueue(pq);
         pq->on_ioq = 0;
         /*
          * Here we will only delete/modify descriptors that
-         * didn't fire (see comments in DeleteFD()).
+         * didn't fire (see comments in RemoveEvent()).
          */
-        DeleteFD(pq->pds, pq->npds);
+        RemoveEvent(pq->pds, pq->npds);
 
         if (pq->coroutine->type & CO::Type::OnSleepQueue)
           pinstance->DeleteFromSleepQueue(pq->coroutine);
-        pq->coroutine->state = CO::State::KReady;
+        pq->coroutine->state = CO::State::kReady;
         pinstance->AddToRunableQueueTail(pq->coroutine);
       }
-    }  // all ioq checked
+    }  // all ioq checked,move ready coroutine from sleepq(epoll return from
+       // timeout) and ioq to runnableq
 
     for (i = 0; i < nfd; i++) {
-      /* Delete/modify descriptors that fired */
+      // Delete/modify descriptors that fired
+      // nowthat all happend events recorded on PollQueue->pollfd
+      // restore reventslist to default
       osfd = reinterpret_cast<FDDetail *>(evtlist_[i].data.ptr)->rawfd;
       FD_REVENTS(osfd) = 0;
+      // after deleteevent, still had events remain? add to epfd again
       events = GetEvents(osfd);
       op = events ? EPOLL_CTL_MOD : EPOLL_CTL_DEL;
       ev.events = events;
-      // ev.data.fd = osfd;
       ev.data.ptr = reinterpret_cast<void *>(revtlist_[i]);
       if (epoll_ctl(epfd_, op, osfd, &ev) == 0 && op == EPOLL_CTL_DEL) {
         // epolldata_->evtlist_cnt--;
       }
     }
-  }
+  }  // if not time out
 }
+#endif  // use epoll

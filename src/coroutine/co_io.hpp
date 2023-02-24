@@ -2,31 +2,42 @@
 #ifndef __CO_IO_HPP__
 #define __CO_IO_HPP__
 
-#include <errno.h>
-#include <fcntl.h>      //for fcntl
-#include <poll.h>       //for pollfd
-#include <sys/ioctl.h>  //for octl
-#include <sys/socket.h>
-#include <sys/uio.h>  //for iovec
+#include <errno.h>       //for errno
+#include <fcntl.h>       //for fcntl
+#include <poll.h>        //for pollfd
+#include <sys/ioctl.h>   //for octl
+#include <sys/socket.h>  //for socket
+#include <sys/uio.h>     //for iovec
 
 #include "common.hpp"
 #include "coroutine.h"
-#include "poller.h"
+#ifdef USE_EPOLL
+#include "poller.h"  //for epoll poller
+#elif defined(USE_IOURING)
+#include "iouring.hpp"  //for iouring poller
+#endif
 
 namespace CO {
-
-NetFd *newNetFD(int osfd, int nonblock, int is_socket) {
+// Memory leak, nodiscard
+[[nodiscard]] NetFd *newNetFD(int osfd, int nonblock, int is_socket) {
   NetFd *fd;
   int flags = 1;
 
   auto p = Coroutine::getInstance();
-  if (p->get_poller()->CheckValidFD(osfd) < 0) return nullptr;
-  fd = reinterpret_cast<NetFd *>(calloc(1, sizeof(NetFd)));
-  if (!fd) return NULL;
+  [[unlikely]] if (p->get_poller()->CheckValidFD(osfd) < 0)
+    return nullptr;
+  fd = reinterpret_cast<NetFd *>(calloc(1, sizeof(NetFd)));  // fixme
+  [[unlikely]] if (!fd)
+    return nullptr;
 
   fd->osfd = osfd;
   fd->inuse = 1;
-  fd->next = NULL;
+  fd->next = nullptr;
+  // #ifdef USE_IOURING
+  //   fd->private_data = reinterpret_cast<void *>(new CO::UringDetail);
+  // #elif defined(USE_EPOLL)
+
+  // #endif
 
   if (nonblock) {
     /* Use just one system call */
@@ -34,20 +45,25 @@ NetFd *newNetFD(int osfd, int nonblock, int is_socket) {
     /* Do it the Posix way */
     if ((flags = fcntl(osfd, F_GETFL, 0)) < 0 ||
         fcntl(osfd, F_SETFL, flags | O_NONBLOCK) < 0) {
-      return NULL;
+      return nullptr;
     }
   }
 
   return fd;
 }
 
-int closeNetFD(NetFd *fd) {
+[[nodiscard]] int closeNetFD(NetFd *fd) {  // fixeme
+#ifdef USE_EPOLL
   auto p = Coroutine::getInstance();
-  if (p->get_poller()->PrerareCloseFD(fd->osfd) < 0) return -1;
+  if (p->get_poller()->PrepareCloseFD(fd->osfd) < 0) return -1;
+#elif defined(USE_IOURING)
+
+#endif
+
   return close(fd->osfd);
 }
-
-int NetFdPoll(CO::NetFd *fd, int how, CO::useconds timeout) {
+#ifdef USE_EPOLL
+[[nodiscard]] int NetFdPoll(NetFd *fd, int how, useconds timeout) {
   pollfd pd;
   int n;
 
@@ -56,7 +72,8 @@ int NetFdPoll(CO::NetFd *fd, int how, CO::useconds timeout) {
   pd.revents = 0;
 
   auto p = Coroutine::getInstance();
-  if ((n = p->Poll(&pd, 1, timeout)) < 0) return -1;
+  [[unlikely]] if ((n = p->Poll(&pd, 1, timeout)) < 0)
+    return -1;
   if (n == 0) {
     /* Timed out */
     errno = ETIME;
@@ -70,43 +87,72 @@ int NetFdPoll(CO::NetFd *fd, int how, CO::useconds timeout) {
   return 0;
 }
 
-NetFd *co_accept(NetFd *fd, sockaddr *addr, int *addrlen, useconds timeout) {
-  int osfd, err;
-  NetFd *newfd;
-
-  while ((osfd = accept(fd->osfd, addr, (socklen_t *)addrlen)) < 0) {
-    if (errno == EINTR) continue;
-    if (!((errno == EAGAIN) || (errno == EWOULDBLOCK))) return NULL;
-    /* Wait until the socket becomes readable */
-    if (NetFdPoll(fd, POLLIN, timeout) < 0) return NULL;
+#elif defined(USE_IOURING)
+[[nodiscard]] int NetFdPoll(NetFd *fd, useconds timeout) {
+  UringDetail *data = reinterpret_cast<UringDetail *>(fd->private_data);
+  // data->fd = fd->osfd;
+  // data->event = how;
+  auto p = Coroutine::getInstance();
+  int n;
+  [[unlikely]] if ((n = p->Poll(std::vector<UringDetail *>(1, data), timeout)) <
+                   0)
+    return -1;
+  if (n == 0) {
+    /* Timed out */
+    errno = ETIME;
+    return -1;
   }
-  // #if defined(MD_ACCEPT_NB_INHERITED)
-  //   newfd = newNetFD(osfd, 0, 1);
-  // #elif defined(MD_ACCEPT_NB_NOT_INHERITED)
-  //   newfd = newNetFD(osfd, 1, 1);
-  // #endif
-  newfd = newNetFD(osfd, 1, 1);
-  if (nullptr == newfd) {
+  if (!data->is_active) {
+    // errno = EBADF;
+    return -1;
+  }
+  return 0;
+}
+#endif
+
+[[nodiscard]] NetFd *co_accept(NetFd *listen_fd, sockaddr *addr, int *addrlen,
+                               useconds timeout) {
+  int osfd, err;
+
+#ifdef USE_EPOLL
+  while ((osfd = accept(listen_fd->osfd, addr, (socklen_t *)addrlen)) < 0) {
+    if (errno == EINTR) continue;
+    if (!((errno == EAGAIN) || (errno == EWOULDBLOCK))) return nullptr;
+    /* Wait until the socket becomes readable */
+    if (NetFdPoll(listen_fd, POLLIN, timeout) < 0) return nullptr;
+  }
+#elif defined(USE_IOURING)
+  UringDetail *data = new UringDetail;  // fixme
+  listen_fd->private_data = reinterpret_cast<void *>(data);
+
+  auto p = Coroutine::getInstance();
+  p->get_poller()->accpet_asyn(listen_fd);
+  /* Wait until the socket becomes readable */
+  if (NetFdPoll(listen_fd, timeout) < 0) return nullptr;
+  // while loop?
+  // if(data->cqe.res < 0) return 1;
+  osfd = data->cqe.res;
+  *addr = *reinterpret_cast<sockaddr *>(&data->addr.ipv4_addr);
+  *addrlen = data->addr.lens;
+#endif
+  NetFd *client_fd;
+  client_fd = newNetFD(osfd, 1, 1);
+  [[unlikely]] if (nullptr == client_fd) {
     err = errno;
     close(osfd);
     errno = err;
   }
 
-  return newfd;
+  return client_fd;
 }
-int co_connect(NetFd *fd, const sockaddr *addr, int addrlen, useconds timeout) {
+[[nodiscard]] int co_connect(NetFd *fd, const sockaddr *addr, int addrlen,
+
+                             useconds timeout) {
+#ifdef USE_EPOLL
   int n, err = 0;
 
   while (connect(fd->osfd, addr, addrlen) < 0) {
     if (errno != EINTR) {
-      /*
-       * On some platforms, if connect() is interrupted (errno == EINTR)
-       * after the kernel binds the socket, a subsequent connect()
-       * attempt will fail with errno == EADDRINUSE.  Ignore EADDRINUSE
-       * iff connect() was previously interrupted.  See Rich Stevens'
-       * "UNIX Network Programming," Vol. 1, 2nd edition, p. 413
-       * ("Interrupted connect").
-       */
       if (errno != EINPROGRESS && (errno != EADDRINUSE || err == 0)) return -1;
       /* Wait until the socket becomes writable */
       if (NetFdPoll(fd, POLLOUT, timeout) < 0) return -1;
@@ -123,14 +169,19 @@ int co_connect(NetFd *fd, const sockaddr *addr, int addrlen, useconds timeout) {
     }
     err = 1;
   }
+#elif defined(USE_IOURING)
+
+#endif
 
   return 0;
 }
 
-ssize_t co_read(NetFd *fd, void *buf, size_t nbyte, useconds timeout) {
+[[nodiscard]] ssize_t co_read(NetFd *fd, void *buf, size_t buf_len,
+                              useconds timeout) {
+#ifdef USE_EPOLL
   ssize_t n;
 
-  while ((n = read(fd->osfd, buf, nbyte)) < 0) {
+  while ((n = read(fd->osfd, buf, buf_len)) < 0) {
     if (errno == EINTR) continue;
     if (!((errno == EAGAIN) || (errno == EWOULDBLOCK))) return -1;
 
@@ -139,9 +190,26 @@ ssize_t co_read(NetFd *fd, void *buf, size_t nbyte, useconds timeout) {
   }
 
   return n;
+#elif defined(USE_IOURING)
+
+  auto p = Coroutine::getInstance();
+  UringDetail *data = new UringDetail;  // fixme
+  fd->private_data = reinterpret_cast<void *>(data);
+
+  p->get_poller()->read_asyn(fd, buf, buf_len);
+  // if (errno == EINTR) continue;
+
+  if (NetFdPoll(fd, timeout) < 0) return -1;
+
+  if (data->cqe.res < 0) return -1;
+  return data->cqe.res;
+
+#endif
 }
 
-ssize_t co_readv(NetFd *fd, const iovec *iov, int iov_size, useconds timeout) {
+#ifdef USE_EPOLL
+[[nodiscard]] ssize_t co_readv(NetFd *fd, const iovec *iov, int iov_size,
+                               useconds timeout) {
   ssize_t n;
 
   while ((n = readv(fd->osfd, iov, iov_size)) < 0) {
@@ -154,7 +222,8 @@ ssize_t co_readv(NetFd *fd, const iovec *iov, int iov_size, useconds timeout) {
 
   return n;
 }
-int st_writev_resid(NetFd *fd, iovec **iov, int *iov_size, useconds timeout) {
+[[nodiscard]] int st_writev_resid(NetFd *fd, iovec **iov, int *iov_size,
+                                  useconds timeout) {
   ssize_t n;
 
   while (*iov_size > 0) {
@@ -185,8 +254,8 @@ int st_writev_resid(NetFd *fd, iovec **iov, int *iov_size, useconds timeout) {
 
   return 0;
 }
-int st_write_resid(NetFd *fd, const void *buf, size_t *resid,
-                   useconds timeout) {
+[[nodiscard]] int st_write_resid(NetFd *fd, const void *buf, size_t *resid,
+                                 useconds timeout) {
   iovec iov, *riov;
   int riov_size, rv;
 
@@ -198,13 +267,15 @@ int st_write_resid(NetFd *fd, const void *buf, size_t *resid,
   *resid = iov.iov_len;
   return rv;
 }
-ssize_t co_write(NetFd *fd, const void *buf, size_t nbyte, useconds timeout) {
+[[nodiscard]] ssize_t co_write(NetFd *fd, const void *buf, size_t nbyte,
+                               useconds timeout) {
   size_t resid = nbyte;
   return st_write_resid(fd, buf, &resid, timeout) == 0
              ? (ssize_t)(nbyte - resid)
              : -1;
 }
-ssize_t co_writev(NetFd *fd, const iovec *iov, int iov_size, useconds timeout) {
+[[nodiscard]] ssize_t co_writev(NetFd *fd, const iovec *iov, int iov_size,
+                                useconds timeout) {
   ssize_t n, rv;
   size_t nleft, nbyte;
   int index, iov_cnt;
@@ -247,7 +318,7 @@ ssize_t co_writev(NetFd *fd, const iovec *iov, int iov_size, useconds timeout) {
         } else {
           tmp_iov = reinterpret_cast<iovec *>(
               calloc(1, (iov_size - index) * sizeof(iovec)));
-          if (tmp_iov == NULL) return -1;
+          if (nullptr == tmp_iov) return -1;
         }
       }
 
@@ -273,5 +344,22 @@ ssize_t co_writev(NetFd *fd, const iovec *iov, int iov_size, useconds timeout) {
 
   return rv;
 }
+#elif defined(USE_IOURING)
+[[nodiscard]] ssize_t co_write(NetFd *fd, const void *buf, size_t buf_len,
+                               useconds timeout) {
+  auto p = Coroutine::getInstance();
+  UringDetail *data = new UringDetail;  // fixme
+  fd->private_data = reinterpret_cast<void *>(data);
+
+  p->get_poller()->write_asyn(fd, buf, buf_len);
+  // if (errno == EINTR) continue;
+
+  if (NetFdPoll(fd, timeout) < 0) return -1;
+
+  if (data->cqe.res < 0) return -1;
+  return data->cqe.res;
+}
+#endif
+
 }  // namespace CO
 #endif  //__CO_IO_HPP__

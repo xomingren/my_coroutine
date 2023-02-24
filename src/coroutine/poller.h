@@ -1,10 +1,8 @@
+#include "common.hpp"
+#ifdef USE_EPOLL
 #pragma once
 #ifndef __CO_POLLER_H__
 #define __CO_POLLER_H__
-
-#include <vector>
-
-#include "common.hpp"
 
 class epoll_event;
 class pollfd;
@@ -21,7 +19,7 @@ class Poller final {
 
  private:
   struct FDDetail {
-    FDDetail()
+    FDDetail() noexcept
         : rd_ref_cnt(0), wr_ref_cnt(0), ex_ref_cnt(0), revents(0), rawfd(-1) {}
     int rd_ref_cnt;
     int wr_ref_cnt;
@@ -35,22 +33,21 @@ class Poller final {
   std::vector<FDDetail *> revtlist_;
 
  private:
-  // about fd, every process had an individual fd-table, start with 0
-  // 0-stdin 1-stdout 2-stderr ,we might use from 3
-  int GetEvents(int fd) const;
+  int GetEvents(int fd) const noexcept;
 
  public:
-  int pollerInitOrDie();
+  [[nodiscard]] int pollerInitOrDie();
 
-  int CheckValidFD(int osfd) const;
+  [[nodiscard]] int CheckValidFD(int osfd) const noexcept;
 
-  void DeleteFD(pollfd *pds, int npds);
+  void RemoveEvent(pollfd *pds, int npds);
 
-  int AddFD(pollfd *pds, int npds);
+  [[nodiscard]] int RegisterEvent(pollfd *pds, int npds);
 
-  int PrerareCloseFD(int osfd);
+  [[nodiscard]] int PrepareCloseFD(int osfd) const noexcept;
 
   void Dispatch(void);
 };  // class Poller
 }  // namespace CO
 #endif  //__CO_POLLER_H__
+#endif  // use EPOLL

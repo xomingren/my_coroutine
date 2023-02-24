@@ -38,11 +38,11 @@ Entity *CO::Coroutine::co_create(F &&f, int joinable, size_t stk_size) {
   //   }
   // }
 
-  co->state = CO::State::KReady;
+  co->state = CO::State::kReady;
   active_count_++;
   AddToRunableQueueTail(co);
 
   return co;
 }
 
-#endif
+#endif  //__CO_TEMPLATE_IMPL_HPP__

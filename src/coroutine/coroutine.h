@@ -10,9 +10,11 @@ namespace CO {
 
 class Time;
 class Poller;
+class IOuring;
 class Coroutine final {
   friend class Time;
   friend class Poller;
+  friend class IOuring;
 
  public:
  private:
@@ -23,24 +25,31 @@ class Coroutine final {
   Coroutine &operator=(const Coroutine &&) = delete;
 
  public:
-  static Coroutine *getInstance();
+  [[maybe_unused]] static Coroutine *getInstance();
 
  public:
   template <typename F>
-  Entity *co_create(F &&f, int joinable, size_t stk_size);
+  [[nodiscard]] Entity *co_create(F &&f, int joinable,
+                                  [[maybe_unused]] size_t stk_size);
   void yield();
-  int Poll(pollfd *pds, int npds, useconds timeout);
-  Poller *get_poller() const;
 
-  // Entity *get_sleep_queue() const { return sleep_queue_; }
+#ifdef USE_EPOLL
+  [[nodiscard]] int Poll(pollfd *pds, int npds, useconds timeout);
+  [[maybe_unused]] Poller *get_poller() const noexcept;
+#elif defined(USE_IOURING)
+  [[nodiscard]] int Poll(std::vector<UringDetail *> req, useconds timeout);
+  [[maybe_unused]] IOuring *get_poller() const noexcept;
+#endif
 
  private:
-  int InitOrDie(size_t coroutine_num = kMaxCoroutineSize);
-  GUID IDGenerator();
-  void InitQueue(DoubleLinkedList *l);
+  [[nodiscard]] int InitOrDie(size_t coroutine_num = kMaxCoroutineSize);
+  [[nodiscard]] GUID IDGenerator() noexcept;
+  void InitQueue(DoubleLinkedList *l) noexcept;
 
-  Entity *GetFromRunableQueue(DoubleLinkedList *queue);
-  PollQueue *GetFromPollerQueue(DoubleLinkedList *queue);
+  [[maybe_unused]] Entity *GetFromRunableQueue(
+      DoubleLinkedList *queue) const noexcept;  // fixme
+  [[maybe_unused]] PollQueue *GetFromPollerQueue(
+      DoubleLinkedList *queue) const noexcept;  // fixme
 
   void AddToIOQueue(PollQueue *node);
   void DeleteFromIOQueue(PollQueue *node);
@@ -58,7 +67,7 @@ class Coroutine final {
   void InsertBefore(DoubleLinkedList *a, DoubleLinkedList *b);
   void DeleteFrom(DoubleLinkedList *node);
 
-  Entity **HeapInsert(Entity *co);
+  [[maybe_unused]] Entity **HeapInsert(Entity *co);
   void HeapDelete(Entity *co);
 
   void *MainLoop();
@@ -73,7 +82,13 @@ class Coroutine final {
  private:
   static GUID id_;
   WorkerManager manager_;
+
+#ifdef USE_EPOLL
   std::unique_ptr<Poller> poller_;
+#elif defined(USE_IOURING)
+  std::unique_ptr<IOuring> poller_;
+#endif
+
   Entity *current_coroutine_;
   Entity *main_coroutine_;
 

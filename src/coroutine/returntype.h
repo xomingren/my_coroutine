@@ -3,10 +3,10 @@
 #ifndef __CO_RETURNTYPE_H__
 #define __CO_RETURNTYPE_H__
 
-#include <concepts>
-#include <functional>  //for std::function
-#include <memory>      //for ptr
-#include <unordered_map>
+#include <concepts>       //for concept
+#include <functional>     //for std::function
+#include <memory>         //for ptr
+#include <unordered_map>  //for unordered_map
 
 #include "common.hpp"
 
@@ -27,7 +27,7 @@ class Service : public BaseService {
   using FuncType = std::function<RetType()>;
 
  public:
-  Service(FuncType func) : func_(func) {}
+  explicit Service(FuncType func) : func_(func) {}
   RetType Run() { return func_(); }
 
  private:
@@ -48,7 +48,7 @@ class WorkerManager {
   template <class RetType>
   RetType Excute(const GUID& id)  //
   {
-    if (service_map_.count(id)) {
+    [[likely]] if (service_map_.count(id)) {
       auto service_ptr = service_map_[id];
       Service<RetType>* true_service_ptr =
           dynamic_cast<Service<RetType>*>(service_ptr.get());
