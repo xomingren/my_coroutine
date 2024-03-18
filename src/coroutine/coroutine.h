@@ -11,14 +11,17 @@ namespace CO {
 class Time;
 class Poller;
 class IOuring;
+class TcpServer;
 class Coroutine final {
   friend class Time;
   friend class Poller;
   friend class IOuring;
+  friend class TcpServer;
 
  public:
  private:
   Coroutine();
+  ~Coroutine();
   Coroutine(const Coroutine &) = delete;
   Coroutine(const Coroutine &&) = delete;
   Coroutine &operator=(const Coroutine &) = delete;
@@ -29,15 +32,17 @@ class Coroutine final {
 
  public:
   template <typename F>
-  [[nodiscard]] Entity *co_create(F &&f, int joinable,
-                                  [[maybe_unused]] size_t stk_size);
+  [[nodiscard]] EntityPtr co_create(F &&f, int joinable,
+                                    [[maybe_unused]] size_t stk_size);
   void yield();
+  void Wakeup();
+  void OnSysQuit();
 
 #ifdef USE_EPOLL
   [[nodiscard]] int Poll(pollfd *pds, int npds, useconds timeout);
   [[maybe_unused]] Poller *get_poller() const noexcept;
 #elif defined(USE_IOURING)
-  [[nodiscard]] int Poll(std::vector<UringDetail *> req, useconds timeout);
+  [[nodiscard]] int Poll(std::vector<UringDetailPtr> req, useconds timeout);
   [[maybe_unused]] IOuring *get_poller() const noexcept;
 #endif
 
@@ -46,20 +51,22 @@ class Coroutine final {
   [[nodiscard]] GUID IDGenerator() noexcept;
   void InitQueue(DoubleLinkedList *l) noexcept;
 
-  [[maybe_unused]] Entity *GetFromRunableQueue(
+  [[maybe_unused]] EntityPtr **GetFromRunableQueue(
       DoubleLinkedList *queue) const noexcept;  // fixme
   [[maybe_unused]] PollQueue *GetFromPollerQueue(
       DoubleLinkedList *queue) const noexcept;  // fixme
 
   void AddToIOQueue(PollQueue *node);
   void DeleteFromIOQueue(PollQueue *node);
+  // some IO coroutine will stuck in io_queue, never had a change to beening
+  // runnable and get themselves' context switched, they'll hold an ownership of
+  // EntityPtr, so we clean io_queue on dctor. all in all, functions that called
+  // SwitchContext() may never return, so we have to use shared_ptr carefully
+  void ClearIOQueue();
 
   void AddToRunableQueueTail(Entity *e);
   void DeleteFromRunableQueue(Entity *e);
   void InsertAfterRunableQueueHead(Entity *e);
-
-  void AddToSleepQueue(Entity *co, useconds timeout);
-  void DeleteFromSleepQueue(Entity *e);
 
   void AddToZombieQueue();
   void DeleteFromZombieQueue();
@@ -67,41 +74,46 @@ class Coroutine final {
   void InsertBefore(DoubleLinkedList *a, DoubleLinkedList *b);
   void DeleteFrom(DoubleLinkedList *node);
 
-  [[maybe_unused]] Entity **HeapInsert(Entity *co);
-  void HeapDelete(Entity *co);
+  void AddToSleepQueue(EntityPtr& co, useconds timeout);
+  void DeleteFromSleepQueue(EntityPtr& co);
+  [[maybe_unused]] EntityPtr *HeapInsert(EntityPtr& co);
+  void HeapDelete(EntityPtr& co);
 
   void *MainLoop();
   void DoWork();
   static void Wrapper();
   void CheckSleep();
   void Schedule();
-  void SwitchContext(Entity *cur);
+  void SwitchContext(Entity *cur, bool destroy = false);
+  // the interrupt will be "delivered"
+  // only when a target thread is about to block.
+  void Interrupt(EntityPtr co);
   void OnExit(void *retval);
   void Cleanup(Entity *);
 
  private:
   static GUID id_;
   WorkerManager manager_;
+  useconds last_time_checked;
+  int active_count_ = 0;
+  int wakeupfd_;
 
 #ifdef USE_EPOLL
   std::unique_ptr<Poller> poller_;
 #elif defined(USE_IOURING)
   std::unique_ptr<IOuring> poller_;
 #endif
+  EntityPtr primordial_;
+  // share ownership with Tcpserver and io_queue
+  EntityPtr current_coroutine_;
+  EntityPtr main_coroutine_;
 
-  Entity *current_coroutine_;
-  Entity *main_coroutine_;
+  DoubleLinkedList runable_queue_;
+  DoubleLinkedList io_queue_;
+  DoubleLinkedList zombie_queue_;
+  EntityPtr sleep_queue_;
+  int sleep_queue_size_;
 
-  useconds last_time_checked;
-
-  DoubleLinkedList runable_queue_; /* run queue for this vp */
-  DoubleLinkedList io_queue_;      /* io queue for this vp */
-  DoubleLinkedList zombie_queue_;  /* zombie queue for this vp */
-
-  Entity *sleep_queue_;  /* sleep queue for this vp */
-  int sleep_queue_size_; /* number of threads on sleep queue */
-
-  int active_count_ = 0;
 };  // class Coroutine
 
 #include "template_impl.hpp"

@@ -36,11 +36,15 @@ class Service : public BaseService {
 
 class WorkerManager {
   using BaseServicePtr = std::shared_ptr<BaseService>;
-  using GUID = uint32_t;
+  // using GUID = uint32_t;
 
  public:
   template <class ServiceType>
   void RegisterService(const GUID& id, const ServiceType& service) {
+    // BaseServicePtr ptr = std::make_shared<ServiceType>(service);
+    // auto pair = std::make_pair(id, ptr);
+
+    // service_map_.insert(pair);
     service_map_.insert(std::pair<GUID, BaseServicePtr>(
         id, BaseServicePtr(std::make_shared<ServiceType>(service))));
   };
@@ -57,6 +61,9 @@ class WorkerManager {
       return RetType();
     }
   }
+
+ public:
+  ~WorkerManager() {}
 
  private:
   std::unordered_map<GUID, BaseServicePtr> service_map_;

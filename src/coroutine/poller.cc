@@ -13,12 +13,12 @@ using namespace CO;
 using namespace std;
 
 CO::Poller::Poller()
-    : maxfd_(10000),
+    : maxfd_(kMaxFD),
       epfd_(-1),
       evtlist_(maxfd_, epoll_event()),
       revtlist_(maxfd_, nullptr) {
   for (int i = 0; i < revtlist_.size(); ++i) {
-    revtlist_[i] = new FDDetail;
+    revtlist_[i] = new FDDetail;  // fixme
     memset(revtlist_[i], 0, sizeof(FDDetail));
     revtlist_[i]->rawfd = i;
   }
@@ -156,7 +156,6 @@ int CO::Poller::PrepareCloseFD(int osfd) const noexcept {
     errno = EBUSY;
     return -1;
   }
-
   return 0;
 }
 
@@ -166,7 +165,7 @@ void CO::Poller::Dispatch(void) {
   PollQueue *pq;
   pollfd *pds, *epds;
   epoll_event ev;
-  int timeout, nfd, i, osfd, notify;
+  int timeout, nfd, i, osfd, activated;
   int events, op;
   short revents;
 
@@ -206,7 +205,7 @@ void CO::Poller::Dispatch(void) {
     for (q = pinstance->io_queue_.next; q != &pinstance->io_queue_;
          q = q->next) {
       pq = pinstance->GetFromPollerQueue(q);
-      notify = 0;
+      activated = 0;
       // how many fd on single node of ioq
       epds = pq->pds + pq->npds;
 
@@ -229,11 +228,11 @@ void CO::Poller::Dispatch(void) {
 
         pds->revents = revents;
         if (revents) {
-          notify = 1;
+          activated = 1;
         }
       }  // 1 coroutine checked
 
-      if (notify) {
+      if (activated) {
         pinstance->DeleteFromIOQueue(pq);
         pq->on_ioq = 0;
         /*

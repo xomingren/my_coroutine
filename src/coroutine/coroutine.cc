@@ -1,8 +1,9 @@
 #include "coroutine.h"
 
-#include <assert.h>  //for assert
-#include <poll.h>    //for pollfd
-#include <stddef.h>  //for __builtin_offsetof
+#include <assert.h>       //for assert
+#include <poll.h>         //for pollfd
+#include <stddef.h>       //for __builtin_offsetof
+#include <sys/eventfd.h>  //for eventfd
 
 #ifdef USE_EPOLL
 #include "poller.h"
@@ -10,6 +11,7 @@
 #include "iouring.hpp"
 #endif
 
+#include "tcpserver.hpp"
 #include "time.hpp"
 
 using namespace CO;
@@ -24,17 +26,12 @@ void CO::Coroutine::InitQueue(DoubleLinkedList *l) noexcept {
   l->prev = l;
 }
 
-void CO::Coroutine::DeleteFromRunableQueue(Entity *e) {
-  // e->links.prev->next = e->links.next;
-  // e->links.next->prev = e->links.prev;
-  DeleteFrom(&e->links);
-}
+void CO::Coroutine::DeleteFromRunableQueue(Entity *e) { DeleteFrom(&e->links); }
 
 CO::Coroutine::Coroutine() {
-  memset(&runable_queue_, 0, sizeof(runable_queue_));
+  // std::cout << "in Coroutine" << std::endl;
   main_coroutine_ = nullptr;
   last_time_checked = 0;
-  memset(&zombie_queue_, 0, sizeof(zombie_queue_));
   sleep_queue_ = nullptr;
   sleep_queue_size_ = 0;
 #ifdef USE_EPOLL
@@ -43,7 +40,11 @@ CO::Coroutine::Coroutine() {
   poller_ = make_unique<IOuring>();
 #endif
 
-  assert(-1 != InitOrDie());
+  if (InitOrDie() < 0) exit(-1);
+}
+
+CO::Coroutine::~Coroutine() {
+  // ClearIOQueue();
 }
 
 Coroutine *CO::Coroutine::getInstance() {
@@ -52,7 +53,7 @@ Coroutine *CO::Coroutine::getInstance() {
 }
 
 void CO::Coroutine::yield() {
-  Entity *co = current_coroutine_;
+  Entity *co = current_coroutine_.get();
 
   CheckSleep();
   // no need to yield
@@ -67,63 +68,59 @@ void CO::Coroutine::yield() {
 
 int CO::Coroutine::InitOrDie(size_t coroutine_num) {
   if (active_count_) {
-    /* Already initialized */
+    // already initialized, never happen
     return 0;
   }
 
-  // init runable队列、io等待队列、zombie队列
   InitQueue(&runable_queue_);
   InitQueue(&io_queue_);
   InitQueue(&zombie_queue_);
 
-  // 调用IO多路复用函数对应的初始化函数
-  [[unlikely]] if (poller_->pollerInitOrDie() < 0)
+  [[unlikely]] if (poller_->pollerInitOrDie() != 0)
     return -1;
+  wakeupfd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  poller_->setWakeup(wakeupfd_);
+
   last_time_checked = Time::GetTime();
 
-  // 创建idle微线程，idle微线程主要用于调用epoll等待IO事件和处理定时器
+  // init main, eventloop and handle time event here
   main_coroutine_ =
       co_create(bind(&CO::Coroutine::MainLoop, this), 0, kStacksize);
   [[unlikely]] if (nullptr == main_coroutine_)
     return -1;
+  main_coroutine_->smart_ptr_addr = reinterpret_cast<void *>(&main_coroutine_);
   main_coroutine_->type = CO::Type::Main;
   active_count_--;
-  // 将idle微线程从runable队列移除，由于idle微线程只在没有微线程可以运行时，才会主动调度，
-  // 所以不需要加入到run队列
-  DeleteFromRunableQueue(main_coroutine_);
+  // main_coroutine_ only runs when no other running
+  DeleteFromRunableQueue(main_coroutine_.get());
 
-  // 初始化primordial微线程，primordial微线程用来标记系统进程，由于可以直接使用
-  // 系统进程的栈空间，故只需要为primordial微线程分配st_thread_t和私有key数据区
-  Entity *primordial = new Entity;
-  memset(primordial, 0, sizeof(Entity));
-  primordial->guid = IDGenerator();
-  // primordial =  (Entity *)calloc(1, sizeof(Entity) + (kKeysMax * sizeof(void
-  // *)));
-  [[unlikely]] if (nullptr == primordial)
+  primordial_ = make_shared<Entity>();
+  primordial_->smart_ptr_addr = reinterpret_cast<void *>(&primordial_);
+
+  primordial_->guid = IDGenerator();
+  [[unlikely]] if (nullptr == primordial_)
     return -1;
-  // co->private_data = (void **)(co + 1);
-  primordial->state = CO::State::kRunning;
-  primordial->type = CO::Type::Primordial;
+  primordial_->state = CO::State::kRunning;
+  primordial_->type = CO::Type::Primordial;
 
-  std::unique_ptr<ucontext_t> pcontext(std::make_unique<ucontext_t>());
+  std::unique_ptr<ucontext_t> pcontext(
+      std::make_unique<ucontext_t>());  // don't need to allocate memory for
+                                        // ucontext_t.uc_stack.ss_sp
+  // since we won't do makecontext on primordial thread, system will init
+  // minimize it so we can still use get/set
+  primordial_->context = std::move(pcontext);
 
-  char *stackptr = new char[kStacksize];
-  pcontext.get()->uc_stack.ss_sp = stackptr;      // 指定栈空间
-  pcontext.get()->uc_stack.ss_size = kStacksize;  // 指定栈空间大小
-  pcontext.get()->uc_stack.ss_flags = 0;
-  // context.uc_link = &here;//设置后继上下文
-  primordial->context = std::move(pcontext);
-
-  current_coroutine_ = primordial;
+  current_coroutine_ = primordial_;
   active_count_++;
 
-  // 当前运行的微线程是primordial微线程，当primordial微线程退出时，整个进程也会终止
   return 0;
 }
-
-Entity *CO::Coroutine::GetFromRunableQueue(
+// raw data emplace in the start of shared_ptr
+EntityPtr **CO::Coroutine::GetFromRunableQueue(
     DoubleLinkedList *queue) const noexcept {
-  return ((Entity *)((char *)(queue) - __builtin_offsetof(Entity, links)));
+  // return ((Entity *)((char *)(queue) - __builtin_offsetof(Entity, links)));
+  return reinterpret_cast<shared_ptr<Entity> **>(
+      ((char *)(queue) + sizeof(DoubleLinkedList)));
 }
 
 PollQueue *CO::Coroutine::GetFromPollerQueue(
@@ -138,6 +135,22 @@ void CO::Coroutine::AddToIOQueue(PollQueue *node) {
 
 void CO::Coroutine::DeleteFromIOQueue(PollQueue *node) {
   DeleteFrom(&node->links);
+}
+
+void CO::Coroutine::ClearIOQueue() {
+  for (DoubleLinkedList *node = io_queue_.next; node != &io_queue_;
+       node = node->next) {
+    auto pq = GetFromPollerQueue(node);
+
+    for (auto &i : pq->fdlist) {
+      i.reset();
+      // std::cout << "fdlist:::::" << i.use_count() << std::endl;
+    }
+    std::vector<UringDetailPtr> empty;
+    pq->fdlist.swap(empty);
+    DeleteFromIOQueue(pq);
+    pq->coroutine.reset();
+  }
 }
 
 void CO::Coroutine::AddToRunableQueueTail(Entity *e) {
@@ -157,57 +170,77 @@ void CO::Coroutine::DeleteFrom(DoubleLinkedList *node) {
 }
 
 void *CO::Coroutine::MainLoop() {
-  Entity *main = current_coroutine_;
+  Entity *main = current_coroutine_.get();
   while (active_count_ > 0) {
-    // main coro handle event(like epollwait or time expired) here
     poller_->Dispatch();
 
-    /* Check sleep queue for expired threads */
+    // check sleep queue for expired threads
     CheckSleep();
 
-    // 交出运行权，并从runable队列st_vp_t.run_q中调度下一个微线程运行
     main->state = CO::State::kReady;
     SwitchContext(main);
   }
 
-  /* No more threads */
+  // no more threads
   exit(0);
 
-  /* NOTREACHED */
+  // never reach here
   return nullptr;
 }
 
-// 微线程调度逻辑，即调度下一个runable状态微线程运行
+// Schedule: find the next runnable coroutine from queue
 void CO::Coroutine::Schedule() {
-  Entity *co;
-  current_coroutine_->calledbywho = 1;
-  // 如果runable队列_st_this_vp.run_q非空，就选队列首的微线程
-  // 否则调度idle微线程运行
+  EntityPtr me;
+  current_coroutine_->return_from_scheduler = true;
   if (runable_queue_.next != &runable_queue_) {
-    co = GetFromRunableQueue(runable_queue_.next);
-    DeleteFromRunableQueue(co);
+    me = **(GetFromRunableQueue(runable_queue_.next));
+    DeleteFromRunableQueue(((me.get())));
   } else {
-    co = main_coroutine_;
+    me = main_coroutine_;
   }
 
-  assert(co->state == CO::State::kReady);
-  co->state = CO::State::kRunning;
+  assert(me->state == CO::State::kReady);
+  me->state = CO::State::kRunning;
 
-  // 如果函数 setcontext 执行成功，那么调用 setcontext
-  // 的函数将不会返回，因为当前 CPU
-  // 的上下文已经交给其他函数或者过程了，当前函数完全放弃了 对 CPU 的所有权。
-  current_coroutine_ = co;
-  setcontext(co->context.get());
+  current_coroutine_ = ((me));
+  Entity *raw = me.get();
+  me.reset();  // this function never return, so we have to reset here
+  setcontext(((raw))->context.get());
+
+  // never reach here
 }
 
-void CO::Coroutine::SwitchContext(Entity *cur) {
-  cur->calledbywho = 0;
-  getcontext(cur->context.get());
-  if (cur->calledbywho == 0) Coroutine::getInstance()->Schedule();
+void CO::Coroutine::SwitchContext(Entity *cur, bool destroy) {
+  [[likely]] if (!destroy) {
+    cur->return_from_scheduler = false;
+    getcontext(cur->context.get());
+    if (false == cur->return_from_scheduler)
+      Coroutine::getInstance()->Schedule();
+  } else {  // goto quit-clean branch
+    TcpServer *server = TcpServer::getInstance();
+    EntityPtr me = **(GetFromRunableQueue(&cur->links));
+    server->closeConnection(me);
+    me.reset();  // this function never return, so we have to reset here
+    Coroutine::getInstance()->Schedule();
+  }
+}
+
+void CO::Coroutine::Interrupt(EntityPtr co) {
+  // if co is already dead
+  if (co->state == State::kZombie) return;
+
+  co->type |= Type::Interrupt;
+
+  if (co->state == State::kRunning || co->state == State::kReady) return;
+
+  if (co->type & Type::OnSleepQueue) DeleteFromSleepQueue(co);
+
+  co->state = State::kReady;
+  AddToRunableQueueTail(co.get());
 }
 
 void CO::Coroutine::DoWork() {
-  Entity *co = current_coroutine_;
+  Entity *co = current_coroutine_.get();
 
   co->retval = manager_.Excute<void *>(co->guid);  // fixme
 
@@ -217,7 +250,7 @@ void CO::Coroutine::DoWork() {
 void CO::Coroutine::Wrapper() { Coroutine::getInstance()->DoWork(); }
 
 void CO::Coroutine::OnExit(void *returnval) {
-  Entity *co = current_coroutine_;
+  Entity *co = current_coroutine_.get();
 
   co->retval = returnval;
 
@@ -251,27 +284,15 @@ void CO::Coroutine::OnExit(void *returnval) {
   //	_st_stack_free(co->stack);
 
   // 交出控制权，并调度下一个runable状态的微线程，微线程生命周期终止
-  SwitchContext(co);
-  // co->calledbywho = 0;
-  // getcontext(co->context.get());
-  // if (co->calledbywho == 0) Schedule();
+  SwitchContext(co, true);
 
-  /* Not going to land here */
+  // not going to land here
 }
 
-void CO::Coroutine::Cleanup(Entity *co) {
-  // int key;
-
-  // for (key = 0; key < key_max; key++) {
-  //   if (co->private_data[key] && _st_destructors[key]) {
-  //     (*_st_destructors[key])(co->private_data[key]);
-  //     co->private_data[key] = NULL;
-  //   }
-  // }
-}
+void CO::Coroutine::Cleanup(Entity *co) {}
 
 void CO::Coroutine::CheckSleep(void) {
-  Entity *coroutine;
+  EntityPtr coroutine;
   useconds now;
 
   now = Time::GetTime();
@@ -286,15 +307,15 @@ void CO::Coroutine::CheckSleep(void) {
     if (coroutine->due > now) break;
     DeleteFromSleepQueue(coroutine);
 
-    /* If co is waiting on condition variable, set the time out flag */
-    // if (co->state == _ST_ST_COND_WAIT) co->flags |=
-    // _ST_FL_TIMEDOUT;
+    // if co is waiting on condition variable, set the time out flag
+    //  if (co->state == _ST_ST_COND_WAIT) co->flags |=
+    //  _ST_FL_TIMEDOUT;
 
-    /* Make co runnable */
+    // Make co runnable
     assert(!(coroutine->type & Type::Main));
     coroutine->state = CO::State::kReady;
     // Insert at the head of RunQ, to execute timer first.
-    InsertAfterRunableQueueHead(coroutine);
+    InsertAfterRunableQueueHead(coroutine.get());
   }
 }
 
@@ -305,22 +326,19 @@ void CO::Coroutine::InsertAfterRunableQueueHead(Entity *e) {
   runable_queue_.next = &e->links;
 }
 
-void CO::Coroutine::AddToSleepQueue(Entity *co, useconds timeout) {
+void CO::Coroutine::AddToSleepQueue(EntityPtr &co, useconds timeout) {
   co->due = last_time_checked + timeout;
   co->type |= OnSleepQueue;
-  co->heap_index = ++sleep_queue_size_;
+  co->heap_index = ++sleep_queue_size_;  // heap_index start with 1
+  // cout << co.use_count() << endl;
   HeapInsert(co);
+  // cout << co.use_count() << endl;
 }
 
-/*
- * Insert "co" into the timeout heap, in the position
- * specified by co->heap_index.  See docs/timeout_heap.txt
- * for details about the timeout heap.
- */
-Entity **CO::Coroutine::HeapInsert(Entity *co) {
+EntityPtr *CO::Coroutine::HeapInsert(EntityPtr &co) {
   int target = co->heap_index;
   int s = target;
-  Entity **p = &sleep_queue_;
+  auto *p = &(sleep_queue_);
   int bits = 0;
   int bit;
   int index = 1;
@@ -329,35 +347,48 @@ Entity **CO::Coroutine::HeapInsert(Entity *co) {
     s >>= 1;
     bits++;
   }
+  // heap_index start with 1, and the leaf level should be excluded, so minus 2
   for (bit = bits - 2; bit >= 0; bit--) {
     if (co->due < (*p)->due) {
-      Entity *t = *p;
+      EntityPtr t = *p;
       co->pleft = t->pleft;
       co->pright = t->pright;
       *p = co;
       co->heap_index = index;
       co = t;
     }
-    index <<= 1;
+    index <<= 1;  // left child = 2 * N
+    // for instance: heap_index = 10(1010),
+    // highest bit is always 1,ignored,so we get a binary sequence 010,
+    // from top to bottom, follow the rules, 1-right, 0-left
+    // goes like this(left->right->left),compare the due in each position
     if (target & (1 << bit)) {
       p = &((*p)->pright);
-      index |= 1;
+      index |= 1;  // right child = 2 * N + 1
     } else {
-      p = &((*p)->pleft);
+      p = &((*p)->pleft);  // left child = 2 * N
     }
   }
   co->heap_index = index;
   *p = co;
   co->pleft = co->pright = nullptr;
+
+  // cout << co.use_count() << endl;
+  // cout << (*p).use_count() << endl;
   return p;
 }
 
-void CO::Coroutine::HeapDelete(Entity *co) {
-  Entity *t, **p;
+void CO::Coroutine::DeleteFromSleepQueue(EntityPtr &coroutine) {
+  HeapDelete(coroutine);
+  coroutine->type &= ~OnSleepQueue;
+}
+
+void CO::Coroutine::HeapDelete(EntityPtr &co) {
+  EntityPtr t, *p;
   int bits = 0;
   int s, bit;
 
-  /* First find and unlink the last heap element */
+  // first find and unlink the last heap element
   p = &sleep_queue_;
   s = sleep_queue_size_;
   while (s) {
@@ -375,21 +406,18 @@ void CO::Coroutine::HeapDelete(Entity *co) {
   *p = nullptr;
   --sleep_queue_size_;
   if (t != co) {
-    /*
-     * Insert the unlinked last element in place of the element we are
-     * deleting
-     */
+    // Insert the unlinked last element in place of the element we are deleting
+
     t->heap_index = co->heap_index;
     p = HeapInsert(t);
     t = *p;
     t->pleft = co->pleft;
     t->pright = co->pright;
 
-    /*
-     * Reestablish the heap invariant.
-     */
+    // reestablish the heap invariant.
+
     for (;;) {
-      Entity *y; /* The younger child */
+      EntityPtr y;  // the younger child
       int index_tmp;
       if (t->pleft == nullptr)
         break;
@@ -400,8 +428,8 @@ void CO::Coroutine::HeapDelete(Entity *co) {
       else
         y = t->pright;
       if (t->due > y->due) {
-        Entity *tl = y->pleft;
-        Entity *tr = y->pright;
+        EntityPtr tl = y->pleft;
+        EntityPtr tr = y->pright;
         *p = y;
         if (y == t->pleft) {
           y->pleft = t;
@@ -435,11 +463,11 @@ int CO::Coroutine::Poll(pollfd *pds, int npds, useconds timeout) {
   Entity *me = current_coroutine_;
   int n;
 
-  // if (me->flags & _ST_FL_INTERRUPT) {
-  //   me->flags &= ~_ST_FL_INTERRUPT;
-  //   errno = EINTR;
-  //   return -1;
-  // }
+  if (me->type & Interrupt) {
+    me->type &= ~Interrupt;
+    errno = EINTR;
+    return -1;
+  }
 
   if (poller_->RegisterEvent(pds, npds) < 0) return -1;
 
@@ -465,11 +493,11 @@ int CO::Coroutine::Poll(pollfd *pds, int npds, useconds timeout) {
     }
   }
 
-  // if (me->flags & _ST_FL_INTERRUPT) {
-  //   me->flags &= ~_ST_FL_INTERRUPT;
-  //   errno = EINTR;
-  //   return -1;
-  // }
+  if (me->type & Interrupt) {
+    me->type &= ~Interrupt;
+    errno = EINTR;
+    return -1;
+  }
 
   return n;
 }
@@ -478,45 +506,44 @@ Poller *CO::Coroutine::get_poller() const noexcept { return poller_.get(); }
 
 #elif defined(USE_IOURING)
 
-// pollfd is for compatible with poll and kqueue, may consider change it
-int CO::Coroutine::Poll(vector<UringDetail *> data, useconds timeout) {
+int CO::Coroutine::Poll(vector<UringDetailPtr> data, useconds timeout) {
   PollQueue node;
-  Entity *me = current_coroutine_;
   int n;
 
-  // if (me->flags & _ST_FL_INTERRUPT) {
-  //   me->flags &= ~_ST_FL_INTERRUPT;
-  //   errno = EINTR;
-  //   return -1;
-  // }
+  if (current_coroutine_->type & Type::Interrupt) {
+    current_coroutine_->type &= ~Type::Interrupt;
+    errno = EINTR;
+    return -1;
+  }
 
   if (poller_->submit() <= 0) return -1;
   node.fdlist = data;
-  node.coroutine = me;
+  node.coroutine = current_coroutine_;
   node.on_ioq = 1;
   AddToIOQueue(&node);
-  if (timeout != kNerverTimeout) AddToSleepQueue(me, timeout);
-  me->state = State::kIOWait;
+  if (timeout != kNerverTimeout) AddToSleepQueue(current_coroutine_, timeout);
+  current_coroutine_->state = State::kIOWait;
 
-  SwitchContext(me);
+  SwitchContext(current_coroutine_.get());
 
   n = 0;
-  if (node.on_ioq) {
-    /* If we timed out, the pollq might still be on the ioq. Remove it */
+  if (1 == node.on_ioq) {
+    // if we timed out, the pollq might still be on the ioq. remove it
     DeleteFromIOQueue(&node);
-    // poller_->seen();
-  } else {
-    /* Count the number of ready descriptors */
-    for (auto i : node.fdlist) {
+  } else if (0 == node.on_ioq) {
+    // count the number of ready descriptors
+    for (auto i : node.fdlist) {  // fixme wind up don't need this
       if (i->is_active) ++n;
     }
+  } else {
+    return -2;
   }
 
-  // if (me->flags & _ST_FL_INTERRUPT) {
-  //   me->flags &= ~_ST_FL_INTERRUPT;
-  //   errno = EINTR;
-  //   return -1;
-  // }
+  if (current_coroutine_->type & Type::Interrupt) {
+    current_coroutine_->type &= ~Type::Interrupt;
+    errno = EINTR;
+    return -1;
+  }
 
   return n;
 }
@@ -525,7 +552,23 @@ IOuring *CO::Coroutine::get_poller() const noexcept { return poller_.get(); }
 
 #endif
 
-void CO::Coroutine::DeleteFromSleepQueue(Entity *coroutine) {
-  HeapDelete(coroutine);
-  coroutine->type &= ~OnSleepQueue;
+void Coroutine::Wakeup() {
+  uint64_t one = 1;
+  ssize_t n = ::write(wakeupfd_, &one, sizeof one);
+  [[unlikely]] if (n != sizeof one) {}
+  OnSysQuit();
+}
+
+void CO::Coroutine::OnSysQuit() {
+  // append current_coroutine_ to the very tail, make sure this wind up
+  // coroutine(precisely it was primordial_) execute behind all other
+  // coroutines
+  main_coroutine_->state = State::kReady;
+  current_coroutine_->state = State::kReady;
+  AddToRunableQueueTail(main_coroutine_.get());
+  AddToRunableQueueTail(current_coroutine_.get());
+
+  // execute main, so we can goto dispatch() and execute all the blocking
+  // coroutine there, set them to runnable
+  SwitchContext(current_coroutine_.get());
 }

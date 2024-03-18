@@ -7,11 +7,17 @@
 #include <map>     //for map
 #include <string>  //for string
 
-#include "coroutine.h"
+#include "co_io.hpp"
+#include "time.hpp"
 namespace CO {
 
 class TcpServer {
-  using ConnectionMap = std::map<std::string, NetFd *>;
+  friend class Coroutine;
+#ifdef USE_EPOLL
+  using ConnectionMap = std::map<std::string, std::shared_ptr<NetFD>>;
+#elif defined(USE_IOURING)
+  using ConnectionMap = std::map<EntityPtr, NetFDPtr>;
+#endif
 
  public:
   [[maybe_unused]] static TcpServer *getInstance() {
@@ -20,16 +26,31 @@ class TcpServer {
   }
 
  public:
-  ~TcpServer() {}
+  ~TcpServer() {
+    // all client supposed to be closed gentlely through this
+    CO::Coroutine::getInstance()->Wakeup();
+    // always empty
+    assert(connections_.empty());
+    // if (!connections_.empty()) {
+    //   ConnectionMap empty;
+    //   connections_.swap(empty);
+    // }
+    // std::cout << "out class TcpServer" << std::endl;
+  }
 
  private:
-  TcpServer() = default;
+  TcpServer() {
+    CO::Coroutine::getInstance();  // ensure sequence
+    // std::cout << "in tcpserver" << std::endl;
+  };
   TcpServer(const TcpServer &) = delete;
   TcpServer(const TcpServer &&) = delete;
   TcpServer &operator=(const TcpServer &) = delete;
   TcpServer &operator=(const TcpServer &&) = delete;
 
  private:
+  NetFDPtr listen_fd_;
+  EntityPtr acceptor_;
   Callable message_handler_;
   ConnectionMap connections_;
   int next_conn_id_ = 1;
@@ -41,21 +62,21 @@ class TcpServer {
   void start(F &&f) {
     message_handler_ = std::move(f);
     int listen_fd = CreateAndListenOrDie();
-    CO::NetFd *listen_netfd = CO::newNetFD(listen_fd, 1, 1);
-    if (nullptr == listen_netfd) {
-      printf("NetFd open socket failed.\n");
-      // return -1;
+    listen_fd_ = CO::NewNetFD(listen_fd, 1, 1, 0);
+    if (nullptr == listen_fd_) {
+      printf("NetFD open socket failed.\n");
       exit(-1);
     }
     CO::Coroutine *p = CO::Coroutine::getInstance();
-    CO::Entity *acceptor =
-        p->co_create(std::bind(&TcpServer::Acceptor, TcpServer::getInstance(),
-                               (void *)listen_netfd),
-                     1, 0);
-    if (nullptr == acceptor) {
+
+    acceptor_ = p->co_create(
+        std::bind(&TcpServer::Acceptor, TcpServer::getInstance()), 1, 0);
+    if (nullptr == acceptor_) {
       printf("failed to co_create listen coroutine\n");
     }
+    acceptor_->smart_ptr_addr = reinterpret_cast<void *>(&acceptor_);
   }
+  void closeConnection(EntityPtr me) { connections_.erase(me); }
 
  private:
   int CreateAndListenOrDie() {
@@ -89,25 +110,23 @@ class TcpServer {
     }
     return listen_fd;
   }
-  void *Acceptor(void *arg) {
+  void *Acceptor() {
     for (;;) {
-      int addrlen = static_cast<int>(sizeof server_addr_);
+      uint addrlen = sizeof server_addr_;
       sockaddr_in client_addr;
-      CO::NetFd *client_netfd = co_accept(
-          (CO::NetFd *)arg, reinterpret_cast<sockaddr *>(&client_addr),
-          &addrlen, CO::kNerverTimeout);
-      if (nullptr == client_netfd) {
-        continue;
-      }
-
-      client_netfd->addr.local = server_addr_;
-      client_netfd->addr.peer = client_addr;
-
-      char name[64];
-      snprintf(name, sizeof name, "%d#%d", ntohs(server_addr_.sin_port),
-               next_conn_id_);
-      ++next_conn_id_;
-      connections_[name] = client_netfd;
+      NetFDPtr client_netfd;
+      auto opt = co_accept(listen_fd_.get(),
+                           reinterpret_cast<sockaddr *>(&client_addr), &addrlen,
+                           CO::kNerverTimeout);
+      if (opt.has_value()) {
+        [[unlikely]] if (nullptr == opt.value()) {
+          // if (errno == EINTR)  // user called in coroutine::poll()
+          //   continue;
+          continue;
+        }
+        client_netfd = opt.value();
+      } else
+        break;
 
       char ip_buf[INET_ADDRSTRLEN];
       bzero(ip_buf, sizeof(ip_buf));
@@ -118,12 +137,20 @@ class TcpServer {
              client_netfd->osfd);
 
       CO::Coroutine *p = CO::Coroutine::getInstance();
-      CO::Entity *connection =
-          p->co_create(std::bind(message_handler_, (void *)client_netfd), 0, 0);
+      auto connection = p->co_create(
+          (std::bind(message_handler_,
+                     reinterpret_cast<void *>(client_netfd.get()))),
+          0, 0);
       if (nullptr == connection) {
         printf("failed co_create client coroutine\n");
       }
+
+      connections_.insert(std::make_pair(connection, client_netfd));
+      auto iter = connections_.find(connection);
+      auto tmp = const_cast<EntityPtr *>(&(iter->first));
+      connection->smart_ptr_addr = reinterpret_cast<void *>(tmp);
     }
+    return nullptr;
   }
 };  // class tcpserver
 

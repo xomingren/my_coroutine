@@ -16,13 +16,13 @@ class Time {
 
   static int st_usleep(useconds usecs) {
     Coroutine* pinstance = Coroutine::getInstance();
-    Entity* e = pinstance->current_coroutine_;
+    EntityPtr e = pinstance->current_coroutine_;
 
-    // if (me->flags & _ST_FL_INTERRUPT) {
-    //   me->flags &= ~_ST_FL_INTERRUPT;
-    //   errno = EINTR;
-    //   return -1;
-    // }
+    if (e->type & Type::Interrupt) {
+      e->type &= ~Type::Interrupt;
+      errno = EINTR;
+      return -1;
+    }
 
     if (usecs != kNerverTimeout) {
       e->state = State::kSleeping;
@@ -30,10 +30,10 @@ class Time {
     } else
       e->state = State::kSuspend;
 
-    pinstance->SwitchContext(e);
+    pinstance->SwitchContext(e.get());
 
-    if (e->type & Interrupt) {
-      e->type &= ~Interrupt;
+    if (e->type & Type::Interrupt) {
+      e->type &= ~Type::Interrupt;
       errno = EINTR;
       return -1;
     }
@@ -41,8 +41,8 @@ class Time {
     return 0;
   }
 
-  static int sleep_for(int seconds) {
-    return st_usleep((seconds >= 0) ? seconds * (useconds)1000000LL
+  static int sleep_for(int seconds) {  // fixme 1000s = 1000 times
+    return st_usleep((seconds >= 0) ? seconds * static_cast<useconds>(1000000LL)
                                     : kNerverTimeout);
   }
 
